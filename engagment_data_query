@@ -6,7 +6,7 @@ WITH data AS MATERIALIZED (
     , u.uuid
     , acceptance_date
     , first_et
-    , date_part('days',first_et - acceptance_date) AS days_to_onboard
+    , date_part('days',first_et - acceptance_date) AS days_to_first_et -- days_to_onboard
     , transferred_to_coach_at
     , split_part(pv.program_indication_identifier,'_',2) AS indication
     , CASE 
@@ -19,8 +19,8 @@ WITH data AS MATERIALIZED (
         WHEN u.gender NOT IN ('female','Female','F','f','male','Male','M','m') THEN 1 ELSE 0 
       END as is_gender_other
     , FLOOR(DATE_PART('days', NOW() - u.date_of_birth)/365) AS user_age_years
-    , o2.gad
-    , o3.phq
+    , o2.gad AS gad
+    , o3.phq AS phq
     , CASE WHEN o1.surgery_chance_next_year IS NULL THEN 0 ELSE o1.surgery_chance_next_year END AS surgery_1yr
     , MAX(CASE WHEN saa.question_key = 'painSeverity' THEN value ELSE NULL END) AS pain_severity
     , MAX(CASE WHEN saa.question_key = 'vasPain' THEN value ELSE NULL END) AS pain_vas
@@ -29,13 +29,14 @@ WITH data AS MATERIALIZED (
       NULLIF(((MAX(CASE WHEN saa.question_key = 'heightFt' THEN value::int ELSE 0 END) * 12 
         + MAX(CASE WHEN saa.question_key = 'heightIn' THEN value::int ELSE 0 END)) / 39.3701)^2,0) AS BMI
     , MAX(LENGTH(u.bio)) AS bio_length
-    --, MAX(u.occupation) as occupation -- ZP
     , MAX(LENGTH(u.coaching_questions ->> 'key_reasons')) AS reasons_length
     , MAX(LENGTH(u.coaching_questions ->> 'imagine_free')) AS imagine_free_length
     , MAX(CASE WHEN u.coaching_questions ->> 'foresee_barriers' ilike '%limited-time%' THEN 1 ELSE 0 END) AS reason_limited_time
     , MAX(CASE WHEN u.coaching_questions ->> 'foresee_barriers' ilike '%family%' THEN 1 ELSE 0 END) AS reason_family_obligations
     , MAX(CASE WHEN u.coaching_questions ->> 'foresee_barriers' ilike '%work%' THEN 1 ELSE 0 END) AS reason_work_obligations
     , MAX(CASE WHEN u.coaching_questions ->> 'foresee_barriers' ilike '%other%' THEN 1 ELSE 0 END) AS reason_other
+    , date_part('days',transferred_to_coach_at - acceptance_date) AS days_to_coach -- MAKE SURE THIS DOES NOT CREATE DUPLICATES
+    , date_part('days',acceptance_date - NOW()) AS days_since_acceptance -- Acceptance days ago
 
   FROM public.pathways_view pv 
        LEFT JOIN public.users u 
@@ -113,27 +114,48 @@ coach AS (
 inbound_messages AS (
   SELECT 
       d.pathway_id,
-      SUM(CASE WHEN m.transmitted_at >= c.starts_at AND m.transmitted_at < first_et + interval '4 weeks' THEN 1 ELSE 0 END) as inbound_coach_messages_all,
-      SUM(CASE WHEN m.transmitted_at >= c.starts_at AND m.transmitted_at < first_et + interval '4 weeks' AND LENGTH(m.body) > 5 THEN 1 ELSE 0 END) as inbound_coach_messages, -- ZP
-      SUM(CASE WHEN m.transmitted_at >= acceptance_date AND m.transmitted_at < transferred_to_coach_at  AND LENGTH(m.body) > 5 THEN 1 ELSE 0 END) as inbound_coach_messages_1_week, -- ZP
-      SUM(CASE WHEN m.transmitted_at >= acceptance_date AND (m.transmitted_at < c.starts_at OR c.starts_at IS NULL) THEN 1 ELSE 0 END) as inbound_os_messages_all,
-      SUM(CASE WHEN m.transmitted_at >= acceptance_date AND (m.transmitted_at < c.starts_at OR c.starts_at IS NULL) AND LENGTH(m.body) > 5 THEN 1 ELSE 0 END) as inbound_os_messages, -- ZP
       
-      SUM(LENGTH(m.body)) as length_messages, --ZP
+      SUM(CASE WHEN 
+                m.transmitted_at <  transferred_to_coach_at AND 
+                LENGTH(m.body) > 5 AND 
+                m.message_direction = 'from_user'
+          THEN 1 ELSE 0 END) as inbound_coach_messages_1_week, -- ZP
       
-      SUM(CASE WHEN m.body like '%surgery%' THEN 1 ELSE 0 END) surgery_message,  --ZP
-      SUM(CASE WHEN m.body like '%call%' THEN 1 ELSE 0 END) call_message,
-      SUM(CASE WHEN m.body like '%interaction%' THEN 1 ELSE 0 END) interaction_message,
+      SUM(CASE WHEN 
+                m.transmitted_at <  transferred_to_coach_at AND 
+                LENGTH(m.body) > 5 AND 
+                m.message_direction = 'from_hinge_health'
+          THEN 1 ELSE 0 END) as inbound_member_messages_1_week, -- ZP
       
+      SUM(CASE WHEN 
+                m.transmitted_at >= transferred_to_coach_at AND 
+                m.transmitted_at < transferred_to_coach_at + interval '4 weeks' AND
+                LENGTH(m.body) > 5 AND
+                m.message_direction = 'from_user'
+          THEN 1 ELSE 0 END) as inbound_coach_messages_4_weeks, -- ZP
+          
+      SUM(CASE WHEN 
+                m.transmitted_at >= transferred_to_coach_at AND 
+                m.transmitted_at < transferred_to_coach_at + interval '4 weeks' AND
+                LENGTH(m.body) > 5 AND
+                m.message_direction = 'from_hinge_health'
+          THEN 1 ELSE 0 END) as inbound_member_messages_4_weeks, -- ZP
+          
+      SUM(CASE WHEN 
+                m.transmitted_at <  c.starts_at AND 
+                LENGTH(m.body) > 5 AND 
+                m.message_direction = 'from_user'
+          THEN LENGTH(m.body) ELSE 0 END) as inbound_coach_messages_length_1_week, -- ZP
       
-      
-      SUM(CASE WHEN m.body like '%other%' THEN 1 ELSE 0 END) AS reason_other
-      
+      SUM(CASE WHEN m.body like '%surgery%'     AND m.message_direction = 'from_user' AND (m.transmitted_at < c.starts_at OR c.starts_at IS NULL) THEN 1 ELSE 0 END) AS surgery_message,     -- ZP
+      SUM(CASE WHEN m.body like '%call%'        AND m.message_direction = 'from_user' AND (m.transmitted_at < c.starts_at OR c.starts_at IS NULL) THEN 1 ELSE 0 END) AS call_message,        -- ZP
+      SUM(CASE WHEN m.body like '%interaction%' AND m.message_direction = 'from_user' AND (m.transmitted_at < c.starts_at OR c.starts_at IS NULL) THEN 1 ELSE 0 END) AS interaction_message, -- ZP
+      SUM(CASE WHEN m.body like '%video%'       AND m.message_direction = 'from_user' AND (m.transmitted_at < c.starts_at OR c.starts_at IS NULL) THEN 1 ELSE 0 END) AS video_message,       -- ZP
+      SUM(CASE WHEN m.body like '%booking%'     AND m.message_direction = 'from_user' AND (m.transmitted_at < c.starts_at OR c.starts_at IS NULL) THEN 1 ELSE 0 END) AS booking_message      -- ZP
+
   FROM rollups.messages m 
     JOIN data d 
       ON m.user_id = d.user_id
-      AND message_direction = 'from_user'
-      AND m.transmitted_at >= d. acceptance_date
     LEFT JOIN coach c 
       ON m.user_id = c.user_id
   GROUP BY 1
@@ -154,29 +176,42 @@ retention AS (
 )
 
 SELECT 
-  d.*,
-  COALESCE(inbound_os_messages_all,0) AS inbound_os_messages_all,
-  COALESCE(inbound_os_messages,0) AS inbound_os_messages,
-  COALESCE(inbound_coach_messages_all,0) AS inbound_coach_messages_all,
+  d.days_since_acceptance,
+  d.days_to_first_et,
+  d.days_to_coach,
+  d.indication, 
+  d.is_gender_female,
+  d.is_gender_male,
+  d.is_gender_other,
+  -- d.user_age_years, -- REMOVED AS MIGHT BE PHI
+  d.bio_length,
+  d.reasons_length,
+  d.imagine_free_length,
+  d.reason_limited_time,
+  d.reason_family_obligations,
+  d.reason_work_obligations,
+  d.reason_other,
+  d.surgery_1yr,
+  d.pain_severity,
+  d.pain_vas,
+  d.pain_description_length,
+  d.BMI,
+  d.gad,
+  d.phq,
+  COALESCE(inbound_coach_messages_4_weeks,0) AS inbound_coach_messages_4_weeks,
   COALESCE(inbound_coach_messages_1_week,0) AS inbound_coach_messages_1_week,
-  COALESCE(inbound_coach_messages,0) AS inbound_coach_messages,
-  COALESCE(r.ets_per_week,0) AS ets_per_week_4_wk,
-  COALESCE(week_4_retained,0) AS week_4_retained,
-  COALESCE(length_messages,0) AS length_messages, --ZP
+  COALESCE(inbound_coach_messages_length_1_week,0) AS inbound_coach_messages_length_1_week,
+  COALESCE(inbound_member_messages_4_weeks,0) AS inbound_member_messages_4_weeks,
+  COALESCE(inbound_member_messages_1_week,0) AS inbound_member_messages_1_week,
   COALESCE(surgery_message,0) AS surgery_message, --ZP
   COALESCE(call_message,0) AS call_message, --ZP
   COALESCE(interaction_message,0) AS interaction_message, --ZP
-  
-  CASE
-    WHEN inbound_coach_messages >= 6 AND ets_per_week >= 1 THEN 'engaged_responsive'
-    WHEN inbound_coach_messages >= 6 AND COALESCE(ets_per_week,0) < 1 THEN 'unengaged_responsive'
-    WHEN COALESCE(inbound_coach_messages,0) < 6 AND ets_per_week >= 1 THEN 'engaged_unresponsive'
-    WHEN COALESCE(inbound_coach_messages,0) < 6 AND COALESCE(ets_per_week,0) < 1 THEN 'unengaged_unresponsive'
-  END as cluster
+  COALESCE(video_message,0) AS video_message, --ZP
+  COALESCE(booking_message,0) AS booking_message --ZP
+
 FROM data d 
      LEFT JOIN inbound_messages im
       ON d.pathway_id = im.pathway_id 
-     LEFT JOIN retention r 
-      ON d.pathway_id = r.pathway_id
+
 
 
